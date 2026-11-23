@@ -1,0 +1,19 @@
+# Runtime backups, transcripts, and machine-specific snapshots (NEVER commit!)
+backup/
+backups/
+logs/
+*.reg
+*.log
+*_log.txt
+*snapshot*.txt
+*audit_report*.json
+*audit_report*.txt
+_selftest_tmp/
+_empty_tmp/
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

@@ -1,0 +1,6 @@
+# Ensure Windows PowerShell 5.1 scripts & CMD wrappers always keep CRLF line endings
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.md   text eol=lf
