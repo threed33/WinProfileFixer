@@ -32,7 +32,7 @@ $isAdmin = Test-IsAdministrator
 if ($isAdmin) {
     Write-Ok '当前运行在管理员权限下（可获取完整内核过滤驱动与 BitLocker 状态）。'
 } else {
-    Write-Warn '当前为普通权限：核心目录与注册表检查不受影响，但 fltmc / manage-bde 检查需要管理员权限。'
+    Write-Warn '当前为普通权限：核心目录与注册表检查不受影响，但 fltmc / BitLocker (WMI) 检查需要管理员权限。'
 }
 
 # 1. System & CodePage info
@@ -174,14 +174,25 @@ if ($builtInAdmin) {
 
 # 4b. BitLocker
 $bl = Get-BitLockerStatus -DriveLetter 'C:'
-if ($bl.Checked) {
-    if ($bl.ProtectionOn) {
-        Write-Warn '检测到 C: 盘已开启 BitLocker！进入安全模式前务必先备份 BitLocker 恢复密钥，或临时暂停保护 (Suspend-BitLocker)。'
-    } else {
-        Write-Ok 'C: 盘未开启 BitLocker（进入安全模式不会触发恢复密钥拦截）。'
+switch ($bl.Status) {
+    'On' {
+        Write-Warn "检测到 C: 盘已开启 BitLocker / 设备加密（来源: $($bl.Source)，状态: $($bl.ConversionStatus)）！进入安全模式前务必先备好 48 位恢复密钥（https://aka.ms/myrecoverykey），或在「设置 -> 隐私和安全性 -> 设备加密」关闭 / 专业版临时暂停保护 (Suspend-BitLocker)。"
     }
-} else {
-    Write-Info '未检测 BitLocker（需要管理员权限运行本脚本才能读取 manage-bde）。'
+    'EncryptedProtectionOff' {
+        $pctText = if ($null -ne $bl.EncryptionPercentage) { "，加密进度: $($bl.EncryptionPercentage)%" } else { '' }
+        Write-Warn "检测到 C: 盘存在加密数据或正在转换（来源: $($bl.Source)，状态: $($bl.ConversionStatus)$pctText），虽保护当前关闭/暂停，进入安全模式前仍请在「设置 -> 隐私和安全性 -> 设备加密」核实，若正在加/解密请等待完成，并备好 48 位恢复密钥。"
+    }
+    'Off' {
+        Write-Ok "C: 盘未开启 BitLocker / 设备加密（来源: $($bl.Source)，已完全解密，进入安全模式不会触发恢复密钥拦截）。"
+    }
+    default {
+        if ($isAdmin) {
+            Write-Warn "未能自动确认 C: 盘 BitLocker / 设备加密状态（请勿默认未开启！）：$($bl.Raw)"
+            Write-Warn '进入安全模式前请务必手动打开「设置 -> 隐私和安全性 -> 设备加密」或运行 manage-bde -status C: 亲眼核实。'
+        } else {
+            Write-Info '未检测 BitLocker / 设备加密（需管理员权限读取 WMI/manage-bde；也可手动打开「设置 -> 隐私和安全性 -> 设备加密」确认）。'
+        }
+    }
 }
 
 # 4c. Kernel Filter Drivers (CldFlt, AV)

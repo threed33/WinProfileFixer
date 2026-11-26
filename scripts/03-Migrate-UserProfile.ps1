@@ -464,13 +464,18 @@ if (-not $NoCompatJunction) {
     }
 }
 
-$aclOut = (& icacls.exe $newPath 2>&1 | Out-String)
-$acctShort = ($targetProfile.Account -split '\\')[-1]
-if ($aclOut -match [regex]::Escape($acctShort) -or $aclOut -match [regex]::Escape($TargetSid)) {
-    Write-Ok "验收 4/4：NTFS ACL 权限完整保留（包含 $($targetProfile.Account)）"
+$aclCheck = Test-DirectoryAclContainsSid -Path $newPath -Sid $TargetSid
+if ($aclCheck.Checked -and $aclCheck.HasAccess) {
+    Write-Ok "验收 4/4：NTFS ACL 权限完整保留（$($targetProfile.Account) [$TargetSid] -> $($aclCheck.Rights)）"
 } else {
-    Write-Warn "验收 4/4 提示：未在 icacls 输出中匹配到 [$acctShort]，请人工核对下方权限："
-    Write-Host $aclOut
+    $aclOut = (& icacls.exe $newPath 2>&1 | Out-String)
+    $acctShort = ($targetProfile.Account -split '\\')[-1]
+    if ((-not $aclCheck.Checked) -and ($aclOut -match [regex]::Escape($acctShort) -or $aclOut -match [regex]::Escape($TargetSid))) {
+        Write-Ok "验收 4/4：NTFS ACL 权限完整保留（包含 $($targetProfile.Account)）"
+    } else {
+        Write-Warn "验收 4/4 提示：未在 NTFS ACL 中匹配到 SID [$TargetSid]（$($targetProfile.Account)），请人工核对下方权限："
+        Write-Host $aclOut
+    }
 }
 
 Write-Host ''

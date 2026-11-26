@@ -334,17 +334,408 @@ function Get-VolumeFilterDrivers {
     return ($drivers | Select-Object -Unique)
 }
 
+function ConvertFrom-ManageBdeOutput {
+    <#
+    .SYNOPSIS
+        Fail-safely parses manage-bde -status output across English, Simplified Chinese, and Traditional Chinese locales.
+    #>
+    param(
+        [string]$RawText = '',
+        [string]$DriveLetter = 'C:'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RawText)) {
+        return [PSCustomObject]@{
+            Drive                = $DriveLetter
+            Checked              = $false
+            ProtectionOn         = $false
+            IsEncrypted          = $false
+            Status               = 'Unknown'
+            ProtectionStatusCode = 2
+            ConversionStatusCode = -1
+            ConversionStatus     = 'Unknown'
+            EncryptionPercentage = $null
+            Source               = 'manage-bde'
+            Raw                  = ''
+        }
+    }
+
+    $protOn = ($RawText -match 'Protection\s+On|保护已开启|保护已打开|保护状态\s*[:：]\s*(?:保护)?已(?:开启|打开)|保護已開啟|保護已打開|保護狀態\s*[:：]\s*(?:保護)?已(?:開啟|打開)')
+    $protOff = ($RawText -match 'Protection\s+Off|保护已关闭|保护状态\s*[:：]\s*(?:保护)?已关闭|保護已關閉|保護狀態\s*[:：]\s*(?:保護)?已關閉')
+    $convEncrypted = ($RawText -match 'Fully\s+Encrypted|Encryption\s+In\s+Progress|Decryption\s+In\s+Progress|Encryption\s+Paused|Decryption\s+Paused|Used\s+Space\s+Only\s+Encrypted|已完全加密|正在加密|正在解密|已暂停加密|已暂停解密|仅加密已用空间|正在進行加密|正在進行解密|加密已暫停|解密已暫停|僅加密已使用的空間')
+    $convDecrypted = ($RawText -match 'Fully\s+Decrypted|已完全解密')
+
+    $pctVal = $null
+    if ($RawText -match '(?:Percentage\s+Encrypted|已加密百分比|加密百分比)\s*[:：]\s*(\d+(?:[.,]\d+)?)\s*%') {
+        $pctStr = $Matches[1].Replace(',', '.')
+        $parsedPct = 0.0
+        if ([double]::TryParse($pctStr, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsedPct)) {
+            $pctVal = $parsedPct
+        }
+    }
+    $pctNonZero = ($null -ne $pctVal -and $pctVal -gt 0)
+    $pctIsZero = ($null -ne $pctVal -and $pctVal -eq 0)
+
+    $convStatus = 'Unknown'
+    $convCode = -1
+    if ($RawText -match 'Encryption\s+In\s+Progress|正在加密|正在進行加密') {
+        $convStatus = 'EncryptionInProgress'
+        $convCode = 2
+    } elseif ($RawText -match 'Decryption\s+In\s+Progress|正在解密|正在進行解密') {
+        $convStatus = 'DecryptionInProgress'
+        $convCode = 3
+    } elseif ($RawText -match 'Encryption\s+Paused|已暂停加密|加密已暫停') {
+        $convStatus = 'EncryptionPaused'
+        $convCode = 4
+    } elseif ($RawText -match 'Decryption\s+Paused|已暂停解密|解密已暫停') {
+        $convStatus = 'DecryptionPaused'
+        $convCode = 5
+    } elseif ($RawText -match 'Used\s+Space\s+Only\s+Encrypted|仅加密已用空间|僅加密已使用的空間') {
+        $convStatus = 'UsedSpaceOnlyEncrypted'
+        $convCode = 1
+    } elseif ($RawText -match 'Fully\s+Encrypted|已完全加密') {
+        $convStatus = 'FullyEncrypted'
+        $convCode = 1
+    } elseif ($convDecrypted) {
+        $convStatus = 'FullyDecrypted'
+        $convCode = 0
+    }
+
+    $protCode = if ($protOn) { 1 } elseif ($protOff) { 0 } else { 2 }
+
+    # Fail-safe classification: never default unrecognized/garbled output to Off
+    $checked = $false
+    $protectionOn = $false
+    $isEncrypted = $false
+    $status = 'Unknown'
+
+    if ($protOn) {
+        $checked = $true
+        $protectionOn = $true
+        $isEncrypted = $true
+        $status = 'On'
+    } elseif ($convEncrypted -or $pctNonZero) {
+        $checked = $true
+        $protectionOn = $false
+        $isEncrypted = $true
+        $status = 'EncryptedProtectionOff'
+    } elseif ($protOff -and ($convDecrypted -or $pctIsZero)) {
+        $checked = $true
+        $protectionOn = $false
+        $isEncrypted = $false
+        $status = 'Off'
+    }
+
+    return [PSCustomObject]@{
+        Drive                = $DriveLetter
+        Checked              = $checked
+        ProtectionOn         = $protectionOn
+        IsEncrypted          = $isEncrypted
+        Status               = $status
+        ProtectionStatusCode = $protCode
+        ConversionStatusCode = $convCode
+        ConversionStatus     = $convStatus
+        EncryptionPercentage = $pctVal
+        Source               = 'manage-bde'
+        Raw                  = $RawText.Trim()
+    }
+}
+
 function Get-BitLockerStatus {
     param([string]$DriveLetter = 'C:')
-    try {
-        $out = (& manage-bde.exe -status $DriveLetter 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0) {
-            return [PSCustomObject]@{ Drive = $DriveLetter; Checked = $false; ProtectionOn = $false; Raw = $out.Trim() }
+
+    $drive = if ($null -eq $DriveLetter) { '' } else { $DriveLetter.Trim() }
+    if ($drive.Length -gt 2 -and $drive.EndsWith('\')) {
+        $drive = $drive.TrimEnd('\')
+    }
+    if ($drive -match '^[A-Za-z]$') {
+        $drive = "${drive}:"
+    }
+    $drive = $drive.ToUpperInvariant()
+
+    if ($drive -notmatch '^[A-Z]:$') {
+        return [PSCustomObject]@{
+            Drive                = $drive
+            Checked              = $false
+            ProtectionOn         = $false
+            IsEncrypted          = $false
+            Status               = 'Unknown'
+            ProtectionStatusCode = 2
+            ConversionStatusCode = -1
+            ConversionStatus     = 'Unknown'
+            EncryptionPercentage = $null
+            Source               = 'Validation'
+            Raw                  = "Invalid drive letter: $DriveLetter"
         }
-        $isOn = ($out -match 'Protection On|保护已打开|保护状态:\s*已开启')
-        return [PSCustomObject]@{ Drive = $DriveLetter; Checked = $true; ProtectionOn = $isOn; Raw = $out.Trim() }
+    }
+
+    # Tier 1: CIM Win32_EncryptableVolume (OS-language & console-codepage independent)
+    $cimError = ''
+    try {
+        $vol = Get-CimInstance -Namespace 'Root\CIMV2\Security\MicrosoftVolumeEncryption' -ClassName 'Win32_EncryptableVolume' -Filter "DriveLetter = '$drive'" -ErrorAction Stop | Select-Object -First 1
+        if ($null -ne $vol) {
+            $protCode = 2
+            $protRes = Invoke-CimMethod -InputObject $vol -MethodName 'GetProtectionStatus' -ErrorAction SilentlyContinue
+            $protRvProp = if ($protRes) { $protRes.PSObject.Properties['ReturnValue'] } else { $null }
+            $protValProp = if ($protRes) { $protRes.PSObject.Properties['ProtectionStatus'] } else { $null }
+            if ($protRvProp -and [int]$protRvProp.Value -eq 0 -and $protValProp -and $null -ne $protValProp.Value) {
+                $protCode = [int]$protValProp.Value
+            } else {
+                $volProtProp = $vol.PSObject.Properties['ProtectionStatus']
+                if ($volProtProp -and $null -ne $volProtProp.Value) {
+                    $protCode = [int]$volProtProp.Value
+                }
+            }
+
+            $convCode = -1
+            $encPct = $null
+            $convRes = Invoke-CimMethod -InputObject $vol -MethodName 'GetConversionStatus' -ErrorAction SilentlyContinue
+            $convRvProp = if ($convRes) { $convRes.PSObject.Properties['ReturnValue'] } else { $null }
+            $convValProp = if ($convRes) { $convRes.PSObject.Properties['ConversionStatus'] } else { $null }
+            $pctValProp = if ($convRes) { $convRes.PSObject.Properties['EncryptionPercentage'] } else { $null }
+            if ($convRvProp -and [int]$convRvProp.Value -eq 0 -and $convValProp -and $null -ne $convValProp.Value) {
+                $convCode = [int]$convValProp.Value
+                if ($pctValProp -and $null -ne $pctValProp.Value) {
+                    $encPct = [double]$pctValProp.Value
+                }
+            } else {
+                $volConvProp = $vol.PSObject.Properties['ConversionStatus']
+                if ($volConvProp -and $null -ne $volConvProp.Value) {
+                    $convCode = [int]$volConvProp.Value
+                }
+            }
+
+            $convStatus = switch ($convCode) {
+                0 { 'FullyDecrypted' }
+                1 { 'FullyEncrypted' }
+                2 { 'EncryptionInProgress' }
+                3 { 'DecryptionInProgress' }
+                4 { 'EncryptionPaused' }
+                5 { 'DecryptionPaused' }
+                default { 'Unknown' }
+            }
+
+            $checked = $false
+            $protectionOn = $false
+            $isEncrypted = $false
+            $status = 'Unknown'
+
+            if ($protCode -eq 1) {
+                $checked = $true
+                $protectionOn = $true
+                $isEncrypted = $true
+                $status = 'On'
+            } elseif ($protCode -eq 0 -and $convCode -eq 0 -and ($null -eq $encPct -or $encPct -eq 0)) {
+                $checked = $true
+                $protectionOn = $false
+                $isEncrypted = $false
+                $status = 'Off'
+            } elseif ($protCode -eq 0 -and (($convCode -in @(1, 2, 3, 4, 5)) -or ($null -ne $encPct -and $encPct -gt 0))) {
+                $checked = $true
+                $protectionOn = $false
+                $isEncrypted = $true
+                $status = 'EncryptedProtectionOff'
+            }
+
+            $pctRaw = if ($null -ne $encPct) { "$encPct%" } else { 'N/A' }
+            return [PSCustomObject]@{
+                Drive                = $drive
+                Checked              = $checked
+                ProtectionOn         = $protectionOn
+                IsEncrypted          = $isEncrypted
+                Status               = $status
+                ProtectionStatusCode = $protCode
+                ConversionStatusCode = $convCode
+                ConversionStatus     = $convStatus
+                EncryptionPercentage = $encPct
+                Source               = 'CIM'
+                Raw                  = "Win32_EncryptableVolume Drive=$drive ProtectionStatus=$protCode ConversionStatus=$convCode ($convStatus) EncryptionPercentage=$pctRaw"
+            }
+        }
     } catch {
-        return [PSCustomObject]@{ Drive = $DriveLetter; Checked = $false; ProtectionOn = $false; Raw = $_.Exception.Message }
+        $cimError = $_.Exception.Message
+    }
+
+    # Tier 2: BitLocker PowerShell module cmdlet (OS-language independent)
+    $cmdError = ''
+    if (Get-Command -Name 'Get-BitLockerVolume' -ErrorAction SilentlyContinue) {
+        try {
+            $bv = Get-BitLockerVolume -MountPoint $drive -ErrorAction Stop | Select-Object -First 1
+            if ($null -ne $bv) {
+                $protStr = [string]$bv.ProtectionStatus
+                $protCode = switch -Regex ($protStr) {
+                    '^(On|1)$'  { 1; break }
+                    '^(Off|0)$' { 0; break }
+                    default     { 2 }
+                }
+                $volStatusStr = [string]$bv.VolumeStatus
+                $convCode = switch ($volStatusStr) {
+                    'FullyDecrypted'       { 0 }
+                    'FullyEncrypted'       { 1 }
+                    'EncryptionInProgress' { 2 }
+                    'DecryptionInProgress' { 3 }
+                    'EncryptionPaused'     { 4 }
+                    'DecryptionPaused'     { 5 }
+                    default                { -1 }
+                }
+                $encPct = if ($null -ne $bv.EncryptionPercentage) { [double]$bv.EncryptionPercentage } else { $null }
+
+                $checked = $false
+                $protectionOn = $false
+                $isEncrypted = $false
+                $status = 'Unknown'
+
+                if ($protCode -eq 1) {
+                    $checked = $true
+                    $protectionOn = $true
+                    $isEncrypted = $true
+                    $status = 'On'
+                } elseif ($protCode -eq 0 -and $convCode -eq 0 -and ($null -eq $encPct -or $encPct -eq 0)) {
+                    $checked = $true
+                    $protectionOn = $false
+                    $isEncrypted = $false
+                    $status = 'Off'
+                } elseif ($protCode -eq 0 -and (($convCode -in @(1, 2, 3, 4, 5)) -or ($null -ne $encPct -and $encPct -gt 0))) {
+                    $checked = $true
+                    $protectionOn = $false
+                    $isEncrypted = $true
+                    $status = 'EncryptedProtectionOff'
+                }
+
+                $convLabel = if ($volStatusStr) { $volStatusStr } else { 'Unknown' }
+                $pctRaw = if ($null -ne $encPct) { "$encPct%" } else { 'N/A' }
+                return [PSCustomObject]@{
+                    Drive                = $drive
+                    Checked              = $checked
+                    ProtectionOn         = $protectionOn
+                    IsEncrypted          = $isEncrypted
+                    Status               = $status
+                    ProtectionStatusCode = $protCode
+                    ConversionStatusCode = $convCode
+                    ConversionStatus     = $convLabel
+                    EncryptionPercentage = $encPct
+                    Source               = 'BitLockerCmdlet'
+                    Raw                  = "Get-BitLockerVolume Drive=$drive ProtectionStatus=$protStr VolumeStatus=$convLabel EncryptionPercentage=$pctRaw"
+                }
+            }
+        } catch {
+            $cmdError = $_.Exception.Message
+        }
+    }
+
+    # Tier 3: manage-bde.exe fallback with OEM codepage retry under chcp 65001 consoles
+    try {
+        $out = (& manage-bde.exe -status $drive 2>&1 | Out-String)
+        if ($LASTEXITCODE -eq 0) {
+            $parsed = ConvertFrom-ManageBdeOutput -RawText $out -DriveLetter $drive
+            if (-not $parsed.Checked -or $out.Contains([char]0xFFFD)) {
+                $proc = $null
+                try {
+                    if ('System.Text.CodePagesEncodingProvider' -as [type]) {
+                        [System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
+                    }
+                    $oemCp = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+                    $oemEnc = [System.Text.Encoding]::GetEncoding($oemCp)
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = 'manage-bde.exe'
+                    $psi.Arguments = "-status $drive"
+                    $psi.UseShellExecute = $false
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $psi.CreateNoWindow = $true
+                    $psi.StandardOutputEncoding = $oemEnc
+                    $psi.StandardErrorEncoding = $oemEnc
+                    $proc = [System.Diagnostics.Process]::Start($psi)
+                    if ($proc) {
+                        $retryOut = $proc.StandardOutput.ReadToEnd()
+                        $retryErr = $proc.StandardError.ReadToEnd()
+                        $proc.WaitForExit()
+                        if ($proc.ExitCode -eq 0) {
+                            $retryParsed = ConvertFrom-ManageBdeOutput -RawText "$retryOut`r`n$retryErr" -DriveLetter $drive
+                            if ($retryParsed.Checked) {
+                                return $retryParsed
+                            }
+                        }
+                    }
+                } catch {
+                    # Preserve original parse outcome if OEM retry fails
+                } finally {
+                    if ($proc) { $proc.Dispose() }
+                }
+            }
+            return $parsed
+        }
+        $errDetail = $out.Trim()
+        if ([string]::IsNullOrWhiteSpace($errDetail)) {
+            $errDetail = [string](@($cimError, $cmdError) | Where-Object { $_ } | Select-Object -First 1)
+        }
+        return [PSCustomObject]@{
+            Drive                = $drive
+            Checked              = $false
+            ProtectionOn         = $false
+            IsEncrypted          = $false
+            Status               = 'Unknown'
+            ProtectionStatusCode = 2
+            ConversionStatusCode = -1
+            ConversionStatus     = 'Unknown'
+            EncryptionPercentage = $null
+            Source               = 'manage-bde'
+            Raw                  = $errDetail
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Drive                = $drive
+            Checked              = $false
+            ProtectionOn         = $false
+            IsEncrypted          = $false
+            Status               = 'Unknown'
+            ProtectionStatusCode = 2
+            ConversionStatusCode = -1
+            ConversionStatus     = 'Unknown'
+            EncryptionPercentage = $null
+            Source               = 'manage-bde'
+            Raw                  = $_.Exception.Message
+        }
+    }
+}
+
+function Test-DirectoryAclContainsSid {
+    <#
+    .SYNOPSIS
+        Checks NTFS DACL directly by SecurityIdentifier (immune to chcp 65001 / localized account name encoding mismatches).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Sid
+    )
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+        $allowRules = @($rules | Where-Object {
+            $_.IdentityReference.Value.Equals($Sid, [System.StringComparison]::OrdinalIgnoreCase) -and
+            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
+        })
+        $rights = ($allowRules | ForEach-Object { [string]$_.FileSystemRights } | Select-Object -Unique) -join ', '
+        $ownerSid = ''
+        try {
+            $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        } catch {}
+        return [PSCustomObject]@{
+            Checked   = $true
+            HasAccess = ($allowRules.Count -gt 0)
+            Rights    = $rights
+            OwnerSid  = $ownerSid
+            Error     = ''
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Checked   = $false
+            HasAccess = $false
+            Rights    = ''
+            OwnerSid  = ''
+            Error     = $_.Exception.Message
+        }
     }
 }
 
@@ -365,5 +756,6 @@ Export-ModuleMember -Function @(
     'Get-FinalPath', 'Get-ShortPath', 'Send-EnvironmentChangeBroadcast',
     'Get-FirstLinkTarget', 'Test-IsReparsePoint', 'Resolve-SidToAccountName',
     'Test-ValidAsciiProfileName', 'Get-UserProfileInventory',
-    'Get-VolumeFilterDrivers', 'Get-BitLockerStatus', 'Get-SystemCodePageInfo'
+    'Get-VolumeFilterDrivers', 'ConvertFrom-ManageBdeOutput', 'Get-BitLockerStatus',
+    'Test-DirectoryAclContainsSid', 'Get-SystemCodePageInfo'
 )
